@@ -29,9 +29,38 @@ By replacing ASP.NET Core's default `IHostLifetime` with a custom **C#-level sig
 
 ## 🚀 Part 2: Universal Zero-Touch State Preservation Engine (Components + DI Services)
 
-When running Blazor Server across a Kubernetes cluster with an external SignalR transport (like **Azure SignalR Service**), pod restarts do not sever browser WebSocket connections. However, when a pod dies and traffic routes to a new pod, how do you prevent Blazor from throwing *"Could not find circuit"* and wiping out user data?
+When running Blazor Server across a Kubernetes cluster with an external SignalR transport, pod restarts do not sever browser WebSocket connections. However, when a pod dies and traffic routes to a new pod, how do you prevent Blazor from throwing *"Could not find circuit"* and wiping out user data?
 
 This library includes a **100% invisible, zero-touch state preservation engine** that automatically synchronizes in-memory domain state between ASP.NET Core RAM and Redis Cluster across pod failovers—**without requiring developers to write caching code, implement attributes, or inherit from artificial interfaces!**
+
+### 🌐 Transport Layer Offloading: Open-Source vs. Managed SignalR Proxies
+
+To prevent TCP/WebSocket connection drops during Kubernetes rolling updates, you should offload the SignalR transport layer from your backend application pods to an edge gateway or backplane:
+
+#### 1. Open-Source Self-Hosted Proxy (YARP + Redis Backplane)
+For on-premises, private cloud, or sovereign Kubernetes clusters where managed cloud services are unavailable, the industry-standard open-source architecture pairs **Microsoft YARP (Yet Another Reverse Proxy)** with a **Redis Pub/Sub Backplane**:
+* **YARP WebSocket Gateway**: Deploy YARP as an open-source edge proxy cluster in Kubernetes. YARP terminates client WebSockets and routes traffic to backend Blazor pods using cookie-based sticky session affinity (`ServerStickyMode.Required`).
+* **Redis Backplane (`AddStackExchangeRedis`)**: Synchronizes real-time SignalR broadcast messages across multiple backend pods.
+* **Failover Mechanics**: When Backend Pod A undergoes a rolling update, YARP holds the browser's WebSocket open and reroutes the user to Backend Pod B. On Pod B, our **Universal Zero-Touch State Engine** intercepts the boot sequence and rehydrates the user's UI state from Redis Cluster in milliseconds!
+
+```
+[Browser] <──WebSocket──> [Open-Source YARP Gateway / NGINX Ingress]
+                                    │
+                    (Pod A drains; YARP reroutes to Pod B)
+                                    │
+                                    ▼
+                         [Kubernetes Backend Pod B]
+                                    │
+            ┌───────────────────────┴───────────────────────┐
+            ▼                                               ▼
+ [Redis Pub/Sub Backplane]                    [Redis State Cluster (IDistributedCache)]
+ (SignalR Message Scaling)                    (Zero-Touch UI & DI State Rehydration)
+```
+
+#### 2. Fully Managed Proxy (Azure SignalR Service for Blazor Server)
+For Azure cloud environments, offload transport to **Azure SignalR Service** configured with `ServerStickyMode = ServerStickyMode.Required`. Azure SignalR manages WebSocket pooling while our zero-touch engine manages C# state recovery.
+
+---
 
 ### 🧠 The Framework Architecture: How It Works Without Attributes
 Every Razor component inherits from `ComponentBase`. At runtime, any instance variable declared on your derived class that is not a framework primitive (`RenderHandle`, `EventCallback`, `ElementReference`) and not an injected service (`[Inject]`) is guaranteed to be **Developer Domain State**.
@@ -40,21 +69,6 @@ We intercept the lowest layers of ASP.NET Core:
 1. **Component Activator Interception ([ZeroTouchComponentActivator.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ZeroTouchComponentActivator.cs))**: Replaces Microsoft's default `IComponentActivator`. When Blazor instantiates any Razor page, we classify its domain variables using [ComponentStateClassifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ComponentStateClassifier.cs), query Redis Cluster, and synchronously rehydrate its private/public variables in RAM **before `OnInitialized()` runs!**
 2. **Scoped DI Service Interception ([ScopedStateExtensions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedStateExtensions.cs))**: If developers store state inside Scoped Dependency Injected View Models (`ShoppingCartService`), registering them via `AddScopedState<T>()` marks them for automatic rehydration when ASP.NET Core creates the circuit DI container on a new pod!
 3. **Unified Checkpointing ([UniversalZeroTouchCircuitHandler.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/UniversalZeroTouchCircuitHandler.cs))**: When a pod starts shutting down or a connection drops (`OnConnectionDownAsync`), our circuit handler serializes all active components and Scoped DI services into a unified Redis snapshot in one atomic batch.
-
-```
-[Blazor RenderTree & DI Engine] ──► Instantiates Component or Scoped DI Service
-                                            │
-                                            ▼
-                    [ZeroTouchComponentActivator / DI Interceptor]
-                                            │
-                    1. Creates C# instance in RAM
-                    2. Classifies domain variables via ComponentStateClassifier
-                    3. Queries Redis Cluster for previous session snapshot
-                    4. Populates RAM variables BEFORE OnInitialized() runs!
-                                            │
-                                            ▼
-                    [Component & DI Service 100% restored! Zero attributes used!]
-```
 
 ---
 
@@ -100,7 +114,11 @@ builder.Services.AddBlazorKubernetesDraining(options =>
     options.EnableVerboseLogging = true;
 });
 
-// 2. Register Universal Zero-Touch State Preservation (Redis Cluster backed)
+// 2. Register Open-Source Redis Backplane (SignalR message distribution)
+builder.Services.AddSignalR()
+    .AddStackExchangeRedis(builder.Configuration.GetConnectionString("RedisCluster"));
+
+// 3. Register Universal Zero-Touch State Preservation (Redis Cluster backed UI state)
 builder.Services.AddStackExchangeRedisCache(options =>
 {
     options.Configuration = builder.Configuration.GetConnectionString("RedisCluster");
@@ -113,7 +131,7 @@ builder.Services.AddUniversalZeroTouchStatePreservation(options =>
     options.SlidingExpiration = TimeSpan.FromHours(2);
 });
 
-// 3. Register Domain DI Services
+// 4. Register Domain DI Services
 // Use standard AddScoped for stateless infrastructure services:
 builder.Services.AddScoped<AccountRepository>();
 
@@ -125,7 +143,7 @@ var app = builder.Build();
 
 app.UseRouting();
 
-// 4. Map Kubernetes health probe endpoints (/health/ready and /health/live)
+// 5. Map Kubernetes health probe endpoints (/health/ready and /health/live)
 app.MapBlazorKubernetesDrainingHealthChecks();
 
 app.MapRazorComponents<App>()
@@ -169,7 +187,7 @@ public class ShoppingCartService
     private void ApplyCoupon()
     {
         // If Pod A dies right now during a Kubernetes rolling update,
-        // Azure SignalR Service routes the user to Pod B.
+        // YARP / NGINX routes the user to Pod B.
         // On Pod B, ZeroTouchComponentActivator and UniversalZeroTouchCircuitHandler
         // automatically rehydrate ShoppingCartService.Items and _couponCode from Redis
         // before the page renders! The user notices zero interruption!
