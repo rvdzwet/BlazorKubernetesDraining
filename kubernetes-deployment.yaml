@@ -1,0 +1,124 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blazor-server-app
+  labels:
+    app: blazor-server-app
+spec:
+  replicas: 3
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: blazor-server-app
+  template:
+    metadata:
+      labels:
+        app: blazor-server-app
+    spec:
+      # CRITICAL: terminationGracePeriodSeconds must exceed your maximum Blazor drain timeout (e.g., 600s + 30s buffer)
+      # If this is smaller than DrainTimeoutSeconds, Kubernetes will forcefully SIGKILL the pod before draining finishes.
+      terminationGracePeriodSeconds: 630
+
+      # NATIVE KUBERNETES SIDECAR CONTAINERS (Kubernetes v1.28+ beta / v1.29+ GA)
+      # By defining the Kerberos proxy/auth container as an initContainer with restartPolicy: Always,
+      # Kubernetes guarantees that this sidecar stays alive during the entire duration of the pod's lifetime
+      # and will ONLY terminate AFTER the main application containers (Blazor) have completely shut down.
+      # This solves the issue where database connections fail while stateful SignalR circuits are draining!
+      initContainers:
+        - name: kerberos-sidecar
+          image: my-registry/kerberos-auth-proxy:latest
+          restartPolicy: Always
+          env:
+            - name: KRB5_REALM
+              value: "EXAMPLE.COM"
+            - name: KRB5_KDC
+              value: "kdc.example.com"
+          volumeMounts:
+            - name: krb5-config
+              mountPath: /etc/krb5.conf
+              subPath: krb5.conf
+            - name: krb5-keytab
+              mountPath: /etc/krb5.keytab
+              subPath: krb5.keytab
+          resources:
+            limits:
+              memory: "128Mi"
+              cpu: "100m"
+
+      containers:
+        - name: blazor-app
+          image: my-registry/blazor-server-app:latest
+          imagePullPolicy: IfNotPresent
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+            # Set default drain timeout to 600 seconds (10 minutes)
+            - name: DrainingOptions__DrainTimeoutSeconds
+              value: "600"
+
+          # READINESS PROBE:
+          # Points to /health/ready. During normal operations returns 200 OK.
+          # The exact millisecond SIGTERM arrives, our C# DrainingHostLifetime sets Readiness to Unhealthy (503).
+          # Kubernetes immediately removes this pod from load balancer endpoints so NO NEW users connect here.
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+
+          # LIVENESS PROBE:
+          # Points to /health/live. Always returns 200 OK as long as the .NET process is responsive,
+          # EVEN during the 10-minute code-level draining window. This prevents Kubernetes from thinking the
+          # pod is frozen and issuing a premature SIGKILL while active circuits are finishing their work.
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+
+          resources:
+            limits:
+              memory: "1Gi"
+              cpu: "1000m"
+            requests:
+              memory: "512Mi"
+              cpu: "250m"
+
+      volumes:
+        - name: krb5-config
+          configMap:
+            name: krb5-configmap
+        - name: krb5-keytab
+          secret:
+            secretName: krb5-keytab-secret
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: blazor-server-service
+  labels:
+    app: blazor-server-app
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      protocol: TCP
+      name: http
+  selector:
+    app: blazor-server-app
