@@ -1,10 +1,7 @@
 using System;
-using System.Collections.Generic;
 using System.Reflection;
 using System.Text.Json;
 using Microsoft.AspNetCore.Components;
-using Microsoft.AspNetCore.Http;
-using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
@@ -12,104 +9,106 @@ using Microsoft.Extensions.Options;
 namespace BlazorKubernetesDraining;
 
 /// <summary>
-/// Custom IComponentActivator that replaces Microsoft's default component activator.
-/// 
-/// Interception Mechanics:
-/// 1. When Blazor's render engine instantiates any Razor component, CreateInstance is invoked.
-/// 2. Automatically classifies domain variables using ComponentStateClassifier (climbing inheritance hierarchies).
-/// 3. Registers the component with ScopedComponentStateRegistry using WeakReferences to prevent memory leaks.
-/// 4. Synchronously queries Redis Cluster (IDistributedCache) and populates domain variables in RAM
-///    BEFORE component lifecycle methods (OnInitialized/OnParametersSet) execute.
+/// Replaces Microsoft's default IComponentActivator to rehydrate [PersistState] members
+/// from an in-memory cache during component creation.
+///
+/// Performance Architecture:
+/// - This activator does NOT call Redis. It reads from the singleton CircuitStateCache, which
+///   was pre-populated by PersistStateCircuitHandler.OnCircuitOpenedAsync (one Redis call per circuit).
+/// - Components with zero [PersistState] members are short-circuited immediately (no overhead).
+/// - Dictionary lookups per [PersistState] member: O(1) average, zero network I/O.
+///
+/// Session Identity:
+/// - The activator resolves the session ID from a scoped SessionIdentityProvider via the
+///   service provider. This avoids the captive dependency anti-pattern: the activator is a
+///   singleton but reads the session ID through a scoped accessor, not by capturing scoped state.
 /// </summary>
-public class ZeroTouchComponentActivator : IComponentActivator
+public class PersistStateComponentActivator : IComponentActivator
 {
     private readonly IServiceProvider _serviceProvider;
+    private readonly CircuitStateCache _stateCache;
     private readonly StatePreservationOptions _options;
-    private readonly ILogger<ZeroTouchComponentActivator>? _logger;
+    private readonly ILogger<PersistStateComponentActivator>? _logger;
 
-    public ZeroTouchComponentActivator(IServiceProvider serviceProvider)
+    public PersistStateComponentActivator(
+        IServiceProvider serviceProvider,
+        CircuitStateCache stateCache,
+        IOptions<StatePreservationOptions> options,
+        ILogger<PersistStateComponentActivator>? logger = null)
     {
         _serviceProvider = serviceProvider;
-        _options = _serviceProvider.GetService<IOptions<StatePreservationOptions>>()?.Value ?? new StatePreservationOptions();
-        _logger = _serviceProvider.GetService<ILogger<ZeroTouchComponentActivator>>();
+        _stateCache = stateCache;
+        _options = options.Value;
+        _logger = logger;
     }
 
     public IComponent CreateInstance(Type componentType)
     {
-        // 1. Instantiate the component using standard DI / reflection
-        var instance = (IComponent)ActivatorUtilities.CreateInstance(_serviceProvider, componentType);
+        // 1. Create component instance (standard Blazor behavior)
+        var instance = (IComponent)Activator.CreateInstance(componentType)!;
 
         if (!_options.EnableStatePreservation)
         {
             return instance;
         }
 
-        // 2. Automatically classify domain variables across inheritance hierarchies
-        var domainMembers = ComponentStateClassifier.GetDomainStateMembers(componentType);
-        if (domainMembers.Length == 0)
+        // 2. Fast path: skip components with zero [PersistState] members (majority of components)
+        var members = ComponentStateClassifier.GetPersistedMembers(componentType);
+        if (members.Length == 0)
         {
             return instance;
         }
 
         try
         {
-            // 3. Register with Scoped Component Registry (uses WeakReference to prevent memory leaks)
+            // 3. Register for checkpointing on connection drop
             var registry = _serviceProvider.GetService<ScopedComponentStateRegistry>();
-            var componentId = componentType.FullName ?? componentType.Name;
-            registry?.Register(componentId, instance, domainMembers);
+            var componentId = componentType.FullName!;
+            registry?.Register(componentId, instance, members);
 
-            // 4. LOW-LEVEL FRAMEWORK INTERCEPTION: Rehydrate RAM from Redis before initial render!
-            var httpContext = _serviceProvider.GetService<IHttpContextAccessor>()?.HttpContext;
-            var sessionId = httpContext?.User.FindFirst("SessionId")?.Value ?? httpContext?.Connection.Id ?? "default_session";
-            var cache = _serviceProvider.GetService<IDistributedCache>();
+            // 4. Resolve session ID from the scoped provider
+            var sessionProvider = _serviceProvider.GetService<SessionIdentityProvider>();
+            var sessionId = sessionProvider?.SessionId;
 
-            if (cache != null)
+            if (sessionId != null)
             {
-                var redisKey = $"{_options.RedisKeyPrefix}:{sessionId}:Component:{componentId}";
-                var json = cache.GetString(redisKey);
-
-                if (!string.IsNullOrEmpty(json))
+                // 5. Rehydrate from in-memory cache (populated by CircuitHandler, NOT from Redis)
+                int rehydrated = 0;
+                foreach (var member in members)
                 {
-                    var stateDict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json, StateSerializationConfig.Options);
-                    if (stateDict != null)
+                    try
                     {
-                        int rehydratedCount = 0;
-                        foreach (var member in domainMembers)
+                        var cacheKey = $"Component:{componentId}:{member.Name}";
+                        var json = _stateCache.GetMemberValue(sessionId, cacheKey);
+
+                        if (json != null)
                         {
-                            try
-                            {
-                                if (stateDict.TryGetValue(member.Name, out var element))
-                                {
-                                    var targetType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
-                                    var val = JsonSerializer.Deserialize(element, targetType, StateSerializationConfig.Options);
+                            var targetType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
+                            var val = JsonSerializer.Deserialize(json, targetType, StateSerializationConfig.Options);
 
-                                    if (member is PropertyInfo prop) prop.SetValue(instance, val);
-                                    else ((FieldInfo)member).SetValue(instance, val);
+                            if (member is PropertyInfo prop) prop.SetValue(instance, val);
+                            else ((FieldInfo)member).SetValue(instance, val);
 
-                                    rehydratedCount++;
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                // Isolated failure: if one property fails to deserialize due to version mismatch, skip it and continue
-                                _logger?.LogWarning(ex, "Failed to rehydrate property [{Property}] on component [{Component}]. Skipping property.",
-                                    member.Name, componentId);
-                            }
-                        }
-
-                        if (_options.EnableDiagnostics && rehydratedCount > 0)
-                        {
-                            _logger?.LogDebug("Rehydrated {Count} domain variables into component [{Component}] from Redis.",
-                                rehydratedCount, componentId);
+                            rehydrated++;
                         }
                     }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogWarning(ex, "Failed to rehydrate [{Member}] on [{Component}]. Skipping.",
+                            member.Name, componentId);
+                    }
+                }
+
+                if (_options.EnableDiagnostics && rehydrated > 0)
+                {
+                    _logger?.LogDebug("Rehydrated {Count}/{Total} [PersistState] members on [{Component}] from cache.",
+                        rehydrated, members.Length, componentId);
                 }
             }
         }
         catch (Exception ex)
         {
-            // Network resiliency: never throw an exception that would abort component creation or crash the UI page
-            _logger?.LogError(ex, "Error during zero-touch state rehydration for component [{Component}]. Proceeding with default state.",
+            _logger?.LogError(ex, "Error during state rehydration for [{Component}]. Proceeding with defaults.",
                 componentType.FullName);
         }
 

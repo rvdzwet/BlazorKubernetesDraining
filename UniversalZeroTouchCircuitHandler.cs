@@ -5,7 +5,6 @@ using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using Microsoft.AspNetCore.Components.Server.Circuits;
-using Microsoft.AspNetCore.Http;
 using Microsoft.Extensions.Caching.Distributed;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Logging;
@@ -14,73 +13,100 @@ using Microsoft.Extensions.Options;
 namespace BlazorKubernetesDraining;
 
 /// <summary>
-/// Universal CircuitHandler that automatically synchronizes in-memory domain state between ASP.NET Core RAM
-/// and Redis Cluster across Kubernetes pod failovers.
-/// 
-/// Coverage:
-/// 1. Scoped Dependency Injected Services (registered via AddScopedState).
-/// 2. Active Razor Components (tracked via ScopedComponentStateRegistry with WeakReferences).
-/// 
-/// Resiliency Features:
-/// - Uses StateSerializationConfig (circular reference handling, tolerant reading).
-/// - Isolated Try/Catch blocks per service and component to prevent cascading failures during checkpointing.
+/// Scoped CircuitHandler that orchestrates state preservation across pod failovers.
+///
+/// Performance Architecture:
+/// - OnCircuitOpenedAsync: ONE batched Redis read per session. Pre-loads all [PersistState] member
+///   values into the singleton CircuitStateCache. Subsequent component activations read from memory.
+/// - OnConnectionDownAsync: ONE batched Redis write per session. Serializes all tracked components
+///   and DI services with [PersistState] members in a single pass.
+/// - OnCircuitClosedAsync: Evicts the session from the CircuitStateCache to prevent memory leaks.
+///
+/// Scoping:
+/// - This handler is registered as Scoped and correctly resolves scoped DI services
+///   (SessionIdentityProvider, IScopedStateServiceRegistration, ScopedComponentStateRegistry).
 /// </summary>
-public class UniversalZeroTouchCircuitHandler : CircuitHandler
+public class PersistStateCircuitHandler : CircuitHandler
 {
     private readonly IServiceProvider _serviceProvider;
     private readonly ScopedComponentStateRegistry _componentRegistry;
+    private readonly CircuitStateCache _stateCache;
+    private readonly SessionIdentityProvider _sessionProvider;
     private readonly IDistributedCache? _cache;
-    private readonly IHttpContextAccessor? _httpContext;
     private readonly StatePreservationOptions _options;
-    private readonly ILogger<UniversalZeroTouchCircuitHandler>? _logger;
+    private readonly ILogger<PersistStateCircuitHandler>? _logger;
 
-    public UniversalZeroTouchCircuitHandler(
+    public PersistStateCircuitHandler(
         IServiceProvider serviceProvider,
         ScopedComponentStateRegistry componentRegistry,
+        CircuitStateCache stateCache,
+        SessionIdentityProvider sessionProvider,
         IOptions<StatePreservationOptions> options,
-        ILogger<UniversalZeroTouchCircuitHandler>? logger = null)
+        ILogger<PersistStateCircuitHandler>? logger = null)
     {
         _serviceProvider = serviceProvider;
         _componentRegistry = componentRegistry;
+        _stateCache = stateCache;
+        _sessionProvider = sessionProvider;
         _options = options.Value;
         _logger = logger;
         _cache = _serviceProvider.GetService<IDistributedCache>();
-        _httpContext = _serviceProvider.GetService<IHttpContextAccessor>();
     }
 
     /// <summary>
-    /// Invoked automatically when a Blazor circuit opens (or recovers on a newly deployed pod after failover).
-    /// Rehydrates all registered Scoped DI state services before components render.
+    /// Pre-loads ALL [PersistState] data from Redis into the in-memory CircuitStateCache
+    /// and rehydrates Scoped DI services. Runs ONCE per circuit, BEFORE components render.
     /// </summary>
     public override async Task OnCircuitOpenedAsync(Circuit circuit, CancellationToken cancellationToken)
     {
-        if (!_options.EnableStatePreservation || _cache == null)
+        if (!_options.EnableStatePreservation || _cache == null || _sessionProvider.SessionId == null)
         {
             await base.OnCircuitOpenedAsync(circuit, cancellationToken);
             return;
         }
 
-        var sessionId = GetSessionId(circuit);
-        var stateServices = _serviceProvider.GetServices<IScopedStateServiceRegistration>();
+        var sessionId = _sessionProvider.SessionId;
 
-        foreach (var reg in stateServices)
+        try
         {
-            try
-            {
-                var redisKey = $"{_options.RedisKeyPrefix}:{sessionId}:DI:{reg.ServiceType.FullName}";
-                var json = await _cache.GetStringAsync(redisKey, cancellationToken);
+            // 1. Load component state snapshot from Redis (ONE read operation)
+            var componentSnapshotKey = $"{_options.RedisKeyPrefix}:{sessionId}:Components";
+            var componentJson = await _cache.GetStringAsync(componentSnapshotKey, cancellationToken);
 
-                if (!string.IsNullOrEmpty(json))
+            if (!string.IsNullOrEmpty(componentJson))
+            {
+                var snapshot = JsonSerializer.Deserialize<Dictionary<string, string>>(componentJson, StateSerializationConfig.Options);
+                if (snapshot != null)
                 {
-                    var stateDict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json, StateSerializationConfig.Options);
-                    if (stateDict != null)
+                    _stateCache.StoreSnapshot(sessionId, snapshot);
+
+                    if (_options.EnableDiagnostics)
                     {
-                        var members = ComponentStateClassifier.GetDomainStateMembers(reg.ServiceType);
+                        _logger?.LogInformation("Pre-loaded {Count} [PersistState] member values from Redis for session [{Session}].",
+                            snapshot.Count, sessionId);
+                    }
+                }
+            }
+
+            // 2. Rehydrate Scoped DI services directly (they exist in the scoped container now)
+            var diSnapshotKey = $"{_options.RedisKeyPrefix}:{sessionId}:DI";
+            var diJson = await _cache.GetStringAsync(diSnapshotKey, cancellationToken);
+
+            if (!string.IsNullOrEmpty(diJson))
+            {
+                var diSnapshot = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(diJson, StateSerializationConfig.Options);
+                if (diSnapshot != null)
+                {
+                    var stateServices = _serviceProvider.GetServices<IScopedStateServiceRegistration>();
+                    foreach (var reg in stateServices)
+                    {
+                        var members = ComponentStateClassifier.GetPersistedMembers(reg.ServiceType);
                         foreach (var member in members)
                         {
                             try
                             {
-                                if (stateDict.TryGetValue(member.Name, out var element))
+                                var key = $"{reg.ServiceType.FullName}:{member.Name}";
+                                if (diSnapshot.TryGetValue(key, out var element))
                                 {
                                     var targetType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
                                     var val = JsonSerializer.Deserialize(element, targetType, StateSerializationConfig.Options);
@@ -91,112 +117,115 @@ public class UniversalZeroTouchCircuitHandler : CircuitHandler
                             }
                             catch (Exception ex)
                             {
-                                _logger?.LogWarning(ex, "Failed to rehydrate member [{Member}] on Scoped DI service [{Service}]. Skipping member.",
+                                _logger?.LogWarning(ex, "Failed to rehydrate [{Member}] on DI service [{Service}]. Skipping.",
                                     member.Name, reg.ServiceType.FullName);
                             }
-                        }
-
-                        if (_options.EnableDiagnostics)
-                        {
-                            _logger?.LogInformation("Rehydrated Scoped DI service [{Service}] from Redis snapshot.", reg.ServiceType.FullName);
                         }
                     }
                 }
             }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex, "Error rehydrating Scoped DI service [{Service}] from Redis.", reg.ServiceType.FullName);
-            }
+        }
+        catch (Exception ex)
+        {
+            _logger?.LogError(ex, "Error pre-loading state from Redis for session [{Session}].", sessionId);
         }
 
         await base.OnCircuitOpenedAsync(circuit, cancellationToken);
     }
 
     /// <summary>
-    /// Invoked automatically when a connection drops or when a pod is shutting down.
-    /// Checkpoints both Scoped DI services and active Razor components to Redis Cluster.
+    /// Checkpoints all [PersistState] members on tracked components and DI services to Redis
+    /// in TWO batched writes (one for components, one for DI services).
     /// </summary>
     public override async Task OnConnectionDownAsync(Circuit circuit, CancellationToken cancellationToken)
     {
-        if (!_options.EnableStatePreservation || _cache == null)
+        if (!_options.EnableStatePreservation || _cache == null || _sessionProvider.SessionId == null)
         {
             await base.OnConnectionDownAsync(circuit, cancellationToken);
             return;
         }
 
-        var sessionId = GetSessionId(circuit);
+        var sessionId = _sessionProvider.SessionId;
         var cacheOptions = new DistributedCacheEntryOptions { SlidingExpiration = _options.SlidingExpiration };
 
-        // 1. Checkpoint Scoped DI Services
-        var stateServices = _serviceProvider.GetServices<IScopedStateServiceRegistration>();
-        foreach (var reg in stateServices)
+        try
         {
-            try
+            // 1. Batch checkpoint all tracked Razor components into ONE Redis write
+            var componentSnapshot = new Dictionary<string, string>();
+            foreach (var (componentId, instance, members) in _componentRegistry.GetTrackedComponents())
             {
-                var members = ComponentStateClassifier.GetDomainStateMembers(reg.ServiceType);
-                var stateDict = new Dictionary<string, object?>();
-                foreach (var member in members)
-                {
-                    try
-                    {
-                        var val = member is PropertyInfo p ? p.GetValue(reg.Instance) : ((FieldInfo)member).GetValue(reg.Instance);
-                        stateDict[member.Name] = val;
-                    }
-                    catch (Exception ex)
-                    {
-                        _logger?.LogDebug(ex, "Could not read member [{Member}] on DI service [{Service}] during checkpoint.", member.Name, reg.ServiceType.FullName);
-                    }
-                }
-
-                var json = JsonSerializer.Serialize(stateDict, StateSerializationConfig.Options);
-                await _cache.SetStringAsync($"{_options.RedisKeyPrefix}:{sessionId}:DI:{reg.ServiceType.FullName}", json, cacheOptions, cancellationToken);
-            }
-            catch (Exception ex)
-            {
-                _logger?.LogError(ex, "Error checkpointing Scoped DI service [{Service}].", reg.ServiceType.FullName);
-            }
-        }
-
-        // 2. Checkpoint Active Razor Components (WeakReferences are pruned automatically in GetTrackedComponents)
-        foreach (var (componentId, instance, members) in _componentRegistry.GetTrackedComponents())
-        {
-            try
-            {
-                var stateDict = new Dictionary<string, object?>();
                 foreach (var member in members)
                 {
                     try
                     {
                         var val = member is PropertyInfo p ? p.GetValue(instance) : ((FieldInfo)member).GetValue(instance);
-                        stateDict[member.Name] = val;
+                        var key = $"Component:{componentId}:{member.Name}";
+                        componentSnapshot[key] = JsonSerializer.Serialize(val, StateSerializationConfig.Options);
                     }
                     catch (Exception ex)
                     {
-                        _logger?.LogDebug(ex, "Could not read member [{Member}] on component [{Component}] during checkpoint.", member.Name, componentId);
+                        _logger?.LogDebug(ex, "Could not read [{Member}] on component [{Component}].", member.Name, componentId);
                     }
                 }
-
-                var json = JsonSerializer.Serialize(stateDict, StateSerializationConfig.Options);
-                await _cache.SetStringAsync($"{_options.RedisKeyPrefix}:{sessionId}:Component:{componentId}", json, cacheOptions, cancellationToken);
             }
-            catch (Exception ex)
+
+            if (componentSnapshot.Count > 0)
             {
-                _logger?.LogError(ex, "Error checkpointing component [{Component}].", componentId);
+                var json = JsonSerializer.Serialize(componentSnapshot, StateSerializationConfig.Options);
+                await _cache.SetStringAsync($"{_options.RedisKeyPrefix}:{sessionId}:Components", json, cacheOptions, cancellationToken);
+            }
+
+            // 2. Batch checkpoint all Scoped DI services into ONE Redis write
+            var diSnapshot = new Dictionary<string, object?>();
+            var stateServices = _serviceProvider.GetServices<IScopedStateServiceRegistration>();
+            foreach (var reg in stateServices)
+            {
+                var members = ComponentStateClassifier.GetPersistedMembers(reg.ServiceType);
+                foreach (var member in members)
+                {
+                    try
+                    {
+                        var val = member is PropertyInfo p ? p.GetValue(reg.Instance) : ((FieldInfo)member).GetValue(reg.Instance);
+                        diSnapshot[$"{reg.ServiceType.FullName}:{member.Name}"] = val;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug(ex, "Could not read [{Member}] on DI service [{Service}].", member.Name, reg.ServiceType.FullName);
+                    }
+                }
+            }
+
+            if (diSnapshot.Count > 0)
+            {
+                var json = JsonSerializer.Serialize(diSnapshot, StateSerializationConfig.Options);
+                await _cache.SetStringAsync($"{_options.RedisKeyPrefix}:{sessionId}:DI", json, cacheOptions, cancellationToken);
+            }
+
+            if (_options.EnableDiagnostics)
+            {
+                _logger?.LogInformation("Checkpointed {Components} component members and {DI} DI members to Redis for session [{Session}].",
+                    componentSnapshot.Count, diSnapshot.Count, sessionId);
             }
         }
-
-        if (_options.EnableDiagnostics)
+        catch (Exception ex)
         {
-            _logger?.LogInformation("Checkpointed circuit [{CircuitId}] state to Redis.", circuit.Id);
+            _logger?.LogError(ex, "Error checkpointing state to Redis for session [{Session}].", sessionId);
         }
 
         await base.OnConnectionDownAsync(circuit, cancellationToken);
     }
 
-    private string GetSessionId(Circuit circuit)
+    /// <summary>
+    /// Evicts the session's pre-loaded state from the singleton CircuitStateCache to prevent
+    /// unbounded memory growth in long-running pods.
+    /// </summary>
+    public override Task OnCircuitClosedAsync(Circuit circuit, CancellationToken cancellationToken)
     {
-        return _httpContext?.HttpContext?.User.FindFirst("SessionId")?.Value ??
-               _httpContext?.HttpContext?.Connection.Id ??
-               circuit.Id;
+        if (_sessionProvider.SessionId != null)
+        {
+            _stateCache.EvictSession(_sessionProvider.SessionId);
+        }
+
+        return base.OnCircuitClosedAsync(circuit, cancellationToken);
     }
 }

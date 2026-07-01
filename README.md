@@ -1,102 +1,90 @@
-# Blazor Server Stateful Connection Draining & Universal Zero-Touch State Preservation Architecture
+# Blazor Server Stateful Connection Draining & [PersistState] State Preservation
 
-This repository contains a standalone, production-ready reference library and Kubernetes deployment configuration designed to solve the two biggest operational challenges in hosting ASP.NET Core Blazor Server applications:
+Production-ready library for ASP.NET Core Blazor Server applications hosted on Kubernetes, solving:
 
-1. **Stateful SignalR Connection Drops & Kerberos Authentication Teardown** during rolling updates and pod restarts.
-2. **In-Memory Circuit & DI Service State Loss** across distributed pod failovers.
-
----
-
-## 🏛️ Part 1: C#-Level `SIGTERM` Interception & Kerberos Sidecar Architecture
-
-While Kubernetes-level lifecycle hooks (`preStop`) are commonly used in infrastructure-driven setups, our **Enterprise Architect** identified a critical architectural principle: **framework-specific connection draining should be encapsulated within the application layer, not leaked into platform deployment manifests.**
-
-By replacing ASP.NET Core's default `IHostLifetime` with a custom **C#-level signal interceptor ([DrainingHostLifetime.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/DrainingHostLifetime.cs))**, we achieve:
-* **100% Standard Kubernetes Manifests**: No custom `preStop` HTTP endpoints or shell script workarounds in your deployment YAML.
-* **True Cross-Platform Portability**: Works identically across Linux Kubernetes pods, Windows Server IIS, Windows Containers, and Docker Swarm.
-* **Flawless SignalR Preservation**: Intercepts `SIGTERM` before ASP.NET Core sees it, marks Readiness as Unhealthy (`503`), delays framework shutdown, and allows active browser circuits and native Kerberos database sidecars (`initContainers` with `restartPolicy: Always`) to finish their SQL transactions without dropping tickets.
-
-### 🖥️ Cross-Platform Signal Behavior: Windows vs. Linux
-* **Linux & Kubernetes**: Intercepts POSIX **`SIGTERM`** (signal 15) and **`SIGINT`**.
-* **Windows & Windows Server Containers**: .NET 6+ automatically translates Win32 console events (`CTRL_CLOSE_EVENT`, `CTRL_SHUTDOWN_EVENT`, `CTRL_C_EVENT`) from the Windows Host Compute Service (HCS) into `PosixSignal.SIGTERM` / `SIGINT`. Draining works identically!
-
-### ⚡ How to Force an Immediate HARD STOP Without Draining
-1. **Send a Second Signal (Double `Ctrl+C` / Consecutive `SIGTERM`)**: If a signal arrives a second time while draining is in progress, `DrainingHostLifetime` aborts the drain and forces an instant shutdown.
-2. **OS Hard Kill (`SIGKILL` / `taskkill /F`)**: Cannot be intercepted and terminates the process instantly in $0\text{ ms}$.
-3. **Configuration Override**: Set `DrainingOptions__EnableDraining=false` or `DrainTimeoutSeconds=0` in environment variables.
+1. **Stateful SignalR connection drops** during rolling updates (C#-level `SIGTERM` interception).
+2. **In-memory state loss** across pod failovers (explicit `[PersistState]` attribute + Redis).
 
 ---
 
-## 🚀 Part 2: Universal Zero-Touch State Preservation Engine (Components + DI Services)
+## 🏛️ Part 1: C#-Level SIGTERM Interception & Circuit Draining
 
-When running Blazor Server across a Kubernetes cluster with an external SignalR transport, pod restarts do not sever browser WebSocket connections. However, when a pod dies and traffic routes to a new pod, how do you prevent Blazor from throwing *"Could not find circuit"* and wiping out user data?
+Replaces ASP.NET Core's default `IHostLifetime` with [DrainingHostLifetime.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/DrainingHostLifetime.cs) to intercept OS termination signals at the application level, mark Readiness probes as Unhealthy, and delay framework shutdown until all Blazor circuits drain to zero.
 
-This library includes a **100% invisible, zero-touch state preservation engine** that automatically synchronizes in-memory domain state between ASP.NET Core RAM and Redis Cluster across pod failovers—**without requiring developers to write caching code, implement attributes, or inherit from artificial interfaces!**
+**Cross-Platform**: Works on Linux (POSIX `SIGTERM`), Windows (.NET 6+ synthesizes `CTRL_CLOSE_EVENT` → `PosixSignal.SIGTERM`), and Windows Server Containers (HCS `CTRL_SHUTDOWN_EVENT`).
 
-### 🌐 Transport Layer Offloading: Open-Source vs. Managed SignalR Proxies
+**Force Hard Stop**: Double `Ctrl+C`, `SIGKILL`/`taskkill /F`, or set `DrainingOptions__EnableDraining=false`.
 
-To prevent TCP/WebSocket connection drops during Kubernetes rolling updates, you should offload the SignalR transport layer from your backend application pods to an edge gateway or backplane:
+---
 
-#### 1. Open-Source Self-Hosted Proxy (YARP + Redis Backplane)
-For on-premises, private cloud, or sovereign Kubernetes clusters where managed cloud services are unavailable, the industry-standard open-source architecture pairs **Microsoft YARP (Yet Another Reverse Proxy)** with a **Redis Pub/Sub Backplane**:
-* **YARP WebSocket Gateway**: Deploy YARP as an open-source edge proxy cluster in Kubernetes. YARP terminates client WebSockets and routes traffic to backend Blazor pods using cookie-based sticky session affinity (`ServerStickyMode.Required`).
-* **Redis Backplane (`AddStackExchangeRedis`)**: Synchronizes real-time SignalR broadcast messages across multiple backend pods.
-* **Failover Mechanics**: When Backend Pod A undergoes a rolling update, YARP holds the browser's WebSocket open and reroutes the user to Backend Pod B. On Pod B, our **Universal Zero-Touch State Engine** intercepts the boot sequence and rehydrates the user's UI state from Redis Cluster in milliseconds!
+## 🚀 Part 2: [PersistState] Attribute-Based State Preservation
+
+### Why Explicit Opt-In?
+Implicit "zero-touch" state serialization is architecturally dangerous in enterprise codebases:
+- **Security**: Any private field silently leaks to Redis without security review or GDPR consideration.
+- **Deny-list fragility**: Heuristic type filtering will always have gaps that crash at runtime.
+- **Debugging**: When stale state appears, there is no annotation trail to trace what's persisted.
+- **Performance**: Every component queries Redis, even stateless layout/nav components.
+
+The `[PersistState]` attribute gives developers **explicit, visible, reviewable** control over what survives a pod failover.
+
+### Architecture
 
 ```
-[Browser] <──WebSocket──> [Open-Source YARP Gateway / NGINX Ingress]
-                                    │
-                    (Pod A drains; YARP reroutes to Pod B)
-                                    │
-                                    ▼
-                         [Kubernetes Backend Pod B]
-                                    │
-            ┌───────────────────────┴───────────────────────┐
-            ▼                                               ▼
- [Redis Pub/Sub Backplane]                    [Redis State Cluster (IDistributedCache)]
- (SignalR Message Scaling)                    (Zero-Touch UI & DI State Rehydration)
+[Circuit Opens on Pod B (failover)]
+        │
+        ▼
+[PersistStateCircuitHandler.OnCircuitOpenedAsync]
+        │
+        ├── ONE Redis read: loads all [PersistState] member values
+        ├── Stores snapshot in singleton CircuitStateCache (in-memory dictionary)
+        └── Rehydrates Scoped DI services directly
+        │
+        ▼
+[PersistStateComponentActivator.CreateInstance]  (called per component)
+        │
+        ├── Checks ComponentStateClassifier cache → 0 [PersistState] members? Skip (fast path)
+        ├── Reads from in-memory CircuitStateCache (dictionary lookup, zero network I/O)
+        └── Sets [PersistState] fields/properties via reflection
+        │
+        ▼
+[Component renders with restored state. OnInitialized() sees populated values.]
+
+---
+
+[Connection drops / pod terminates]
+        │
+        ▼
+[PersistStateCircuitHandler.OnConnectionDownAsync]
+        │
+        ├── ONE batched Redis write: all tracked component [PersistState] members
+        └── ONE batched Redis write: all Scoped DI service [PersistState] members
+
+---
+
+[Circuit closes (user navigates away or session expires)]
+        │
+        ▼
+[PersistStateCircuitHandler.OnCircuitClosedAsync]
+        │
+        └── Evicts session from CircuitStateCache (prevents memory leak)
 ```
 
-#### 2. Fully Managed Proxy (Azure SignalR Service for Blazor Server)
-For Azure cloud environments, offload transport to **Azure SignalR Service** configured with `ServerStickyMode = ServerStickyMode.Required`. Azure SignalR manages WebSocket pooling while our zero-touch engine manages C# state recovery.
+### Performance Characteristics
+
+| Operation | Cost | When |
+|:---|:---|:---|
+| Component with 0 `[PersistState]` members | Array length check (cached) | Every component create |
+| Component with N `[PersistState]` members | N dictionary lookups | Component create |
+| Redis read | 1 call per circuit open | Circuit open only |
+| Redis write | 2 calls per connection drop | Connection drop only |
+| Memory cleanup | 1 dictionary remove | Circuit close |
 
 ---
 
-### 🧠 The Framework Architecture: How It Works Without Attributes
-Every Razor component inherits from `ComponentBase`. At runtime, any instance variable declared on your derived class that is not a framework primitive (`RenderHandle`, `EventCallback`, `ElementReference`) and not an injected service (`[Inject]`) is guaranteed to be **Developer Domain State**.
+## 🛠️ Integration
 
-We intercept the lowest layers of ASP.NET Core:
-1. **Component Activator Interception ([ZeroTouchComponentActivator.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ZeroTouchComponentActivator.cs))**: Replaces Microsoft's default `IComponentActivator`. When Blazor instantiates any Razor page, we classify its domain variables using [ComponentStateClassifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ComponentStateClassifier.cs), query Redis Cluster, and synchronously rehydrate its private/public variables in RAM **before `OnInitialized()` runs!**
-2. **Scoped DI Service Interception ([ScopedStateExtensions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedStateExtensions.cs))**: If developers store state inside Scoped Dependency Injected View Models (`ShoppingCartService`), registering them via `AddScopedState<T>()` marks them for automatic rehydration when ASP.NET Core creates the circuit DI container on a new pod!
-3. **Unified Checkpointing ([UniversalZeroTouchCircuitHandler.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/UniversalZeroTouchCircuitHandler.cs))**: When a pod starts shutting down or a connection drops (`OnConnectionDownAsync`), our circuit handler serializes all active components and Scoped DI services into a unified Redis snapshot in one atomic batch.
-
----
-
-## 🛡️ Rigorous Failure Mode Analysis & Enterprise Resiliency Design
-
-To guarantee long-term maintainability and prevent memory leaks or cascading failures in high-traffic Kubernetes environments, the state engine incorporates 5 critical defensive engineering protections:
-
-1. **Memory Leak Prevention via `WeakReference<object>` ([ScopedComponentStateRegistry.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedComponentStateRegistry.cs))**:
-   Tracking instantiated components in a long-lived Blazor circuit using strong references would prevent the Garbage Collector from freeing closed pages as users navigate. Our registry tracks components using weak references (`WeakReference<object>`) and prunes dead entries automatically. When a component is disposed, its memory is freed immediately.
-2. **Inheritance Hierarchy Climbing ([ComponentStateClassifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ComponentStateClassifier.cs))**:
-   Instead of using `BindingFlags.DeclaredOnly`, our classifier traverses the entire component inheritance hierarchy up to `ComponentBase`. Domain variables declared on intermediate abstract or base classes are captured and checkpointed reliably.
-3. **Non-Serializable Runtime Exclusion ([ComponentStateClassifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ComponentStateClassifier.cs))**:
-   The metadata classifier automatically detects and excludes non-serializable runtime primitives (`Stream`, `Task`, `Timer`, `CancellationTokenSource`, `IDisposable` sockets, and Reflection metadata) that would otherwise cause JSON serialization exceptions or hangs.
-4. **Resilient JSON Graph Serialization ([StateSerializationConfig.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/StateSerializationConfig.cs))**:
-   Configured with `ReferenceHandler.IgnoreCycles`, `PropertyNameCaseInsensitive = true`, and `MaxDepth = 64` to prevent stack overflows or serialization crashes when domain models contain circular references or navigation properties.
-5. **Isolated Property Try/Catch Boundaries**:
-   In both `ZeroTouchComponentActivator` and `UniversalZeroTouchCircuitHandler`, serialization and rehydration are wrapped in isolated per-property and per-service try/catch blocks. If a single property fails to deserialize due to a schema version mismatch during a deployment, it is logged and skipped without aborting the rest of the component or service rehydration.
-
----
-
-## 🛠️ How to Integrate into Your Blazor Application
-
-### Step 1: Copy Library Files
-Copy the `.cs` files from this repository directly into your Blazor Server project.
-
-### Step 2: Register Services in `Program.cs`
-Add the following lines to your `Program.cs`:
-
+### Program.cs
 ```csharp
 using BlazorKubernetesDraining;
 
@@ -105,101 +93,97 @@ var builder = WebApplication.CreateBuilder(args);
 builder.Services.AddRazorComponents()
     .AddInteractiveServerComponents();
 
-// 1. Register Kubernetes Circuit Draining (SIGTERM interception & tracking)
+// 1. SIGTERM interception & circuit draining
 builder.Services.AddBlazorKubernetesDraining(options =>
 {
-    options.EnableDraining = true;
     options.DrainTimeoutSeconds = 600;
-    options.PollingIntervalMilliseconds = 1000;
-    options.EnableVerboseLogging = true;
 });
 
-// 2. Register Open-Source Redis Backplane (SignalR message distribution)
-builder.Services.AddSignalR()
-    .AddStackExchangeRedis(builder.Configuration.GetConnectionString("RedisCluster"));
-
-// 3. Register Universal Zero-Touch State Preservation (Redis Cluster backed UI state)
+// 2. Redis cache (prerequisite for state preservation)
 builder.Services.AddStackExchangeRedisCache(options =>
 {
     options.Configuration = builder.Configuration.GetConnectionString("RedisCluster");
 });
 
-builder.Services.AddUniversalZeroTouchStatePreservation(options =>
+// 3. [PersistState] attribute-based state preservation
+builder.Services.AddPersistStatePreservation(options =>
 {
-    options.EnableStatePreservation = true;
     options.RedisKeyPrefix = "BlazorStore";
     options.SlidingExpiration = TimeSpan.FromHours(2);
 });
 
-// 4. Register Domain DI Services
-// Use standard AddScoped for stateless infrastructure services:
-builder.Services.AddScoped<AccountRepository>();
-
-// Use AddScopedState for domain services / View Models that hold memory state!
+// 4. Stateful DI services (use AddScopedState instead of AddScoped)
 builder.Services.AddScopedState<ShoppingCartService>();
-builder.Services.AddScopedState<OrderWizardViewModel>();
 
 var app = builder.Build();
-
 app.UseRouting();
-
-// 5. Map Kubernetes health probe endpoints (/health/ready and /health/live)
 app.MapBlazorKubernetesDrainingHealthChecks();
-
-app.MapRazorComponents<App>()
-    .AddInteractiveServerRenderMode();
-
+app.MapRazorComponents<App>().AddInteractiveServerRenderMode();
 app.Run();
 ```
 
----
-
-## 👩‍💻 The Developer Experience: 100% Invisible & Clean
-
-Notice how clean your domain classes and Razor components remain. Developers write **zero attributes, zero interfaces, and zero manual save/load calls**:
-
-### Scoped DI Domain Service (`ShoppingCartService.cs`)
-```csharp
-// Completely standard C# class. No attributes or interfaces needed!
-public class ShoppingCartService
-{
-    public List<CartItem> Items { get; set; } = new();
-    public decimal Total => Items.Sum(i => i.Price * i.Quantity);
-
-    public void AddItem(CartItem item) => Items.Add(item);
-}
-```
-
-### Razor Component (`Cart.razor`)
+### Razor Component
 ```razor
-@page "/cart"
-@inject ShoppingCartService Cart
+@page "/order-wizard"
 
-<h3>Your Cart (@Cart.Items.Count items) - Total: $@Cart.Total</h3>
-
-<InputText @bind-Value="_couponCode" />
-<button class="btn btn-success" @onclick="ApplyCoupon">Apply Coupon</button>
+<h3>Step @_currentStep: Customer Information</h3>
+<InputText @bind-Value="_customerName" />
+<button @onclick="NextStep">Next</button>
 
 @code {
-    // Standard private field. Automatically checkpointed & rehydrated!
-    private string _couponCode = string.Empty;
+    [PersistState]
+    private string _customerName = string.Empty;
 
-    private void ApplyCoupon()
-    {
-        // If Pod A dies right now during a Kubernetes rolling update,
-        // YARP / NGINX routes the user to Pod B.
-        // On Pod B, ZeroTouchComponentActivator and UniversalZeroTouchCircuitHandler
-        // automatically rehydrate ShoppingCartService.Items and _couponCode from Redis
-        // before the page renders! The user notices zero interruption!
-    }
+    [PersistState]
+    private int _currentStep = 1;
+
+    // NOT persisted — transient UI state resets on failover (intentional)
+    private bool _isDropdownOpen = false;
+
+    private void NextStep() => _currentStep++;
+}
+```
+
+### Scoped DI Service
+```csharp
+public class ShoppingCartService
+{
+    [PersistState]
+    public List<CartItem> Items { get; set; } = new();
+
+    // NOT persisted — computed property, recalculated from Items
+    public decimal Total => Items.Sum(i => i.Price * i.Quantity);
 }
 ```
 
 ---
 
-## 📄 License & Restrictions
+## 📂 File Manifest
 
-Licensed under the **MIT License (with Teun Kooijman Exclusion Clause)**. See the [LICENSE](file:///c:/Users/roman/source/repos/SocketConnectionTest/LICENSE) file for full details.
+| File | Role |
+|:---|:---|
+| [PersistStateAttribute.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/PersistStateAttribute.cs) | Opt-in marker attribute for fields/properties |
+| [ComponentStateClassifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ComponentStateClassifier.cs) | Cached reflection scanner for `[PersistState]` members |
+| [CircuitStateCache.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/CircuitStateCache.cs) | Singleton in-memory staging area (eliminates per-component Redis calls) |
+| [SessionIdentityProvider.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/SessionIdentityProvider.cs) | Scoped resolver for stable user session identity |
+| [PersistStateComponentActivator.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ZeroTouchComponentActivator.cs) | `IComponentActivator` replacement (reads from memory, not Redis) |
+| [PersistStateCircuitHandler.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/UniversalZeroTouchCircuitHandler.cs) | Batched Redis I/O on circuit open/close + memory cleanup |
+| [ScopedStateExtensions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedStateExtensions.cs) | `AddScopedState<T>()` for DI services with `[PersistState]` members |
+| [StateSerializationConfig.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/StateSerializationConfig.cs) | Resilient JSON options (cycle handling, case tolerance) |
+| [StatePreservationOptions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/StatePreservationOptions.cs) | Configuration (Redis prefix, expiration, diagnostics) |
+| [DrainingHostLifetime.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/DrainingHostLifetime.cs) | `IHostLifetime` SIGTERM interceptor |
+| [ActiveCircuitTracker.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ActiveCircuitTracker.cs) | Thread-safe circuit counter |
+| [DrainingHealthCheck.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/DrainingHealthCheck.cs) | Readiness (503 on drain) and Liveness (always 200) probes |
+| [DrainingOptions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/DrainingOptions.cs) | Draining configuration |
+| [ServiceCollectionExtensions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ServiceCollectionExtensions.cs) | `AddBlazorKubernetesDraining()` + `AddPersistStatePreservation()` |
+| [ScopedComponentStateRegistry.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedComponentStateRegistry.cs) | WeakReference-based component tracking per circuit |
+| [kubernetes-deployment.yaml](file:///c:/Users/roman/source/repos/SocketConnectionTest/kubernetes-deployment.yaml) | Clean K8s manifest with native Kerberos sidecar |
+
+---
+
+## 📄 License
+
+MIT License (with Teun Kooijman Exclusion Clause). See [LICENSE](file:///c:/Users/roman/source/repos/SocketConnectionTest/LICENSE).
 
 > [!CAUTION]
-> **EXPLICIT EXCLUSION**: This permission and license is **EXPLICITLY NOT GRANTED to Teun Kooijman**. Teun Kooijman is strictly prohibited from using, copying, modifying, merging, publishing, distributing, sublicensing, or selling copies of this Software or any associated documentation files under any circumstances whatsoever.
+> **EXPLICIT EXCLUSION**: This license is **NOT GRANTED to Teun Kooijman** under any circumstances.

@@ -6,24 +6,18 @@ using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Routing;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using Microsoft.Extensions.Options;
 
 namespace BlazorKubernetesDraining;
 
 /// <summary>
 /// Extension methods for registering Blazor Server C#-level SIGTERM interception, health probes,
-/// and Universal Zero-Touch State Preservation in Dependency Injection.
+/// and [PersistState] attribute-based state preservation in Dependency Injection.
 /// </summary>
 public static class ServiceCollectionExtensions
 {
     /// <summary>
-    /// Adds active circuit tracking, custom C#-level SIGTERM interception (IHostLifetime), and Kubernetes Liveness/Readiness health checks.
-    /// Notice: No special Kubernetes preStop lifecycle endpoints or shell scripts are required because DrainingHostLifetime
-    /// catches OS signals directly inside the application process before ASP.NET Core triggers ApplicationStopping.
+    /// Adds active circuit tracking, C#-level SIGTERM interception (IHostLifetime), and Kubernetes Liveness/Readiness health checks.
     /// </summary>
-    /// <param name="services">The IServiceCollection.</param>
-    /// <param name="configureOptions">Optional configuration for DrainingOptions (e.g. DrainTimeoutSeconds).</param>
-    /// <returns>The updated IServiceCollection.</returns>
     public static IServiceCollection AddBlazorKubernetesDraining(
         this IServiceCollection services,
         Action<DrainingOptions>? configureOptions = null)
@@ -39,7 +33,6 @@ public static class ServiceCollectionExtensions
             opt.EnableVerboseLogging = options.EnableVerboseLogging;
         });
 
-        // Ensure ASP.NET Core HostOptions.ShutdownTimeout has a small safety buffer for final process exit
         services.Configure<Microsoft.Extensions.Hosting.HostOptions>(hostOpt =>
         {
             var requiredTimeout = TimeSpan.FromSeconds(15);
@@ -49,20 +42,11 @@ public static class ServiceCollectionExtensions
             }
         });
 
-        // Register shared state and singleton circuit tracker
         services.AddSingleton<CircuitDrainingState>();
         services.AddSingleton<ActiveCircuitTracker>();
-
-        // Blazor resolves CircuitHandler per circuit scope; we forward to our singleton tracker
         services.AddScoped<CircuitHandler>(sp => sp.GetRequiredService<ActiveCircuitTracker>());
-
-        // CRITICAL ARCHITECTURAL DECISION:
-        // Replace ASP.NET Core's default ConsoleLifetime with our DrainingHostLifetime.
-        // This allows our C# code to intercept OS SIGTERM signals directly, prevent default application teardown,
-        // drain active SignalR WebSockets, and only call StopApplication() once all circuits drop to 0.
         services.AddSingleton<IHostLifetime, DrainingHostLifetime>();
 
-        // Register Kubernetes Liveness and Readiness health checks
         services.AddHealthChecks()
             .AddCheck<DrainingReadinessHealthCheck>("readiness", tags: new[] { "ready" })
             .AddCheck<DrainingLivenessHealthCheck>("liveness", tags: new[] { "live" });
@@ -71,17 +55,22 @@ public static class ServiceCollectionExtensions
     }
 
     /// <summary>
-    /// Registers the Universal Zero-Touch State Preservation engine in Dependency Injection.
-    /// 
-    /// This enables automatic, attribute-free, interface-free domain state synchronization between ASP.NET Core RAM
-    /// and Redis Cluster across Kubernetes pod failovers for BOTH:
-    /// 1. Instantiated Razor Components (by replacing IComponentActivator).
-    /// 2. Scoped Dependency Injected domain services (registered via AddScopedState).
+    /// Registers the [PersistState] attribute-based state preservation engine.
+    ///
+    /// Architecture:
+    /// - IComponentActivator: Replaced with PersistStateComponentActivator. Rehydrates [PersistState]
+    ///   members from an in-memory cache (no Redis calls during rendering).
+    /// - CircuitHandler: PersistStateCircuitHandler performs ONE batched Redis read on circuit open
+    ///   and ONE batched Redis write on connection down.
+    /// - CircuitStateCache: Singleton in-memory staging area. Populated once per circuit, evicted on close.
+    /// - SessionIdentityProvider: Scoped service resolving stable user identity for Redis key generation.
+    ///
+    /// Prerequisites:
+    /// - IDistributedCache must be registered (e.g., AddStackExchangeRedisCache).
+    /// - IHttpContextAccessor must be registered (AddHttpContextAccessor).
+    /// - Authentication must populate User.Identity.Name or a "SessionId" claim.
     /// </summary>
-    /// <param name="services">The IServiceCollection.</param>
-    /// <param name="configureOptions">Optional configuration for StatePreservationOptions.</param>
-    /// <returns>The updated IServiceCollection.</returns>
-    public static IServiceCollection AddUniversalZeroTouchStatePreservation(
+    public static IServiceCollection AddPersistStatePreservation(
         this IServiceCollection services,
         Action<StatePreservationOptions>? configureOptions = null)
     {
@@ -96,14 +85,17 @@ public static class ServiceCollectionExtensions
             opt.EnableDiagnostics = options.EnableDiagnostics;
         });
 
-        // 1. Register Scoped Component Registry (tracks active components per user circuit)
+        // Singleton: in-memory staging cache for pre-loaded Redis state
+        services.AddSingleton<CircuitStateCache>();
+
+        // Scoped: session identity, component registry, circuit handler
+        services.AddHttpContextAccessor();
+        services.AddScoped<SessionIdentityProvider>();
         services.AddScoped<ScopedComponentStateRegistry>();
+        services.AddScoped<CircuitHandler, PersistStateCircuitHandler>();
 
-        // 2. Replace ASP.NET Core's default component activator with our zero-touch rehydrating activator
-        services.AddSingleton<IComponentActivator, ZeroTouchComponentActivator>();
-
-        // 3. Register our Universal CircuitHandler to orchestrate rehydration and checkpointing on failovers
-        services.AddScoped<CircuitHandler, UniversalZeroTouchCircuitHandler>();
+        // Singleton: replace default component activator
+        services.AddSingleton<IComponentActivator, PersistStateComponentActivator>();
 
         return services;
     }
@@ -111,8 +103,6 @@ public static class ServiceCollectionExtensions
     /// <summary>
     /// Maps endpoint routes for Kubernetes readiness (/health/ready) and liveness (/health/live) probes.
     /// </summary>
-    /// <param name="endpoints">The IEndpointRouteBuilder.</param>
-    /// <returns>The updated IEndpointRouteBuilder.</returns>
     public static IEndpointRouteBuilder MapBlazorKubernetesDrainingHealthChecks(this IEndpointRouteBuilder endpoints)
     {
         endpoints.MapHealthChecks("/health/ready", new HealthCheckOptions
