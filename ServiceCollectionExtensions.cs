@@ -1,5 +1,6 @@
 using System;
 using Microsoft.AspNetCore.Builder;
+using Microsoft.AspNetCore.Components;
 using Microsoft.AspNetCore.Components.Server.Circuits;
 using Microsoft.AspNetCore.Diagnostics.HealthChecks;
 using Microsoft.AspNetCore.Routing;
@@ -10,7 +11,8 @@ using Microsoft.Extensions.Options;
 namespace BlazorKubernetesDraining;
 
 /// <summary>
-/// Extension methods for registering Blazor Server C#-level SIGTERM interception and health probes in Dependency Injection.
+/// Extension methods for registering Blazor Server C#-level SIGTERM interception, health probes,
+/// and Universal Zero-Touch State Preservation in Dependency Injection.
 /// </summary>
 public static class ServiceCollectionExtensions
 {
@@ -31,6 +33,7 @@ public static class ServiceCollectionExtensions
 
         services.Configure<DrainingOptions>(opt =>
         {
+            opt.EnableDraining = options.EnableDraining;
             opt.DrainTimeoutSeconds = options.DrainTimeoutSeconds;
             opt.PollingIntervalMilliseconds = options.PollingIntervalMilliseconds;
             opt.EnableVerboseLogging = options.EnableVerboseLogging;
@@ -63,6 +66,44 @@ public static class ServiceCollectionExtensions
         services.AddHealthChecks()
             .AddCheck<DrainingReadinessHealthCheck>("readiness", tags: new[] { "ready" })
             .AddCheck<DrainingLivenessHealthCheck>("liveness", tags: new[] { "live" });
+
+        return services;
+    }
+
+    /// <summary>
+    /// Registers the Universal Zero-Touch State Preservation engine in Dependency Injection.
+    /// 
+    /// This enables automatic, attribute-free, interface-free domain state synchronization between ASP.NET Core RAM
+    /// and Redis Cluster across Kubernetes pod failovers for BOTH:
+    /// 1. Instantiated Razor Components (by replacing IComponentActivator).
+    /// 2. Scoped Dependency Injected domain services (registered via AddScopedState).
+    /// </summary>
+    /// <param name="services">The IServiceCollection.</param>
+    /// <param name="configureOptions">Optional configuration for StatePreservationOptions.</param>
+    /// <returns>The updated IServiceCollection.</returns>
+    public static IServiceCollection AddUniversalZeroTouchStatePreservation(
+        this IServiceCollection services,
+        Action<StatePreservationOptions>? configureOptions = null)
+    {
+        var options = new StatePreservationOptions();
+        configureOptions?.Invoke(options);
+
+        services.Configure<StatePreservationOptions>(opt =>
+        {
+            opt.EnableStatePreservation = options.EnableStatePreservation;
+            opt.RedisKeyPrefix = options.RedisKeyPrefix;
+            opt.SlidingExpiration = options.SlidingExpiration;
+            opt.EnableDiagnostics = options.EnableDiagnostics;
+        });
+
+        // 1. Register Scoped Component Registry (tracks active components per user circuit)
+        services.AddScoped<ScopedComponentStateRegistry>();
+
+        // 2. Replace ASP.NET Core's default component activator with our zero-touch rehydrating activator
+        services.AddSingleton<IComponentActivator, ZeroTouchComponentActivator>();
+
+        // 3. Register our Universal CircuitHandler to orchestrate rehydration and checkpointing on failovers
+        services.AddScoped<CircuitHandler, UniversalZeroTouchCircuitHandler>();
 
         return services;
     }
