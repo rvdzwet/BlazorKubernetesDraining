@@ -16,9 +16,9 @@ namespace BlazorKubernetesDraining;
 /// 
 /// Interception Mechanics:
 /// 1. When Blazor's render engine instantiates any Razor component, CreateInstance is invoked.
-/// 2. It automatically classifies all private and public domain variables using ComponentStateClassifier.
-/// 3. Registers the component instance with ScopedComponentStateRegistry for automatic background checkpointing.
-/// 4. Synchronously queries Redis Cluster (IDistributedCache) and populates the component's domain variables in RAM
+/// 2. Automatically classifies domain variables using ComponentStateClassifier (climbing inheritance hierarchies).
+/// 3. Registers the component with ScopedComponentStateRegistry using WeakReferences to prevent memory leaks.
+/// 4. Synchronously queries Redis Cluster (IDistributedCache) and populates domain variables in RAM
 ///    BEFORE component lifecycle methods (OnInitialized/OnParametersSet) execute.
 /// </summary>
 public class ZeroTouchComponentActivator : IComponentActivator
@@ -44,7 +44,7 @@ public class ZeroTouchComponentActivator : IComponentActivator
             return instance;
         }
 
-        // 2. Automatically classify domain variables without requiring attributes or interfaces
+        // 2. Automatically classify domain variables across inheritance hierarchies
         var domainMembers = ComponentStateClassifier.GetDomainStateMembers(componentType);
         if (domainMembers.Length == 0)
         {
@@ -53,7 +53,7 @@ public class ZeroTouchComponentActivator : IComponentActivator
 
         try
         {
-            // 3. Register with Scoped Component Registry for checkpointing
+            // 3. Register with Scoped Component Registry (uses WeakReference to prevent memory leaks)
             var registry = _serviceProvider.GetService<ScopedComponentStateRegistry>();
             var componentId = componentType.FullName ?? componentType.Name;
             registry?.Register(componentId, instance, domainMembers);
@@ -70,25 +70,37 @@ public class ZeroTouchComponentActivator : IComponentActivator
 
                 if (!string.IsNullOrEmpty(json))
                 {
-                    var stateDict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json);
+                    var stateDict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json, StateSerializationConfig.Options);
                     if (stateDict != null)
                     {
+                        int rehydratedCount = 0;
                         foreach (var member in domainMembers)
                         {
-                            if (stateDict.TryGetValue(member.Name, out var element))
+                            try
                             {
-                                var targetType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
-                                var val = JsonSerializer.Deserialize(element, targetType);
+                                if (stateDict.TryGetValue(member.Name, out var element))
+                                {
+                                    var targetType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
+                                    var val = JsonSerializer.Deserialize(element, targetType, StateSerializationConfig.Options);
 
-                                if (member is PropertyInfo prop) prop.SetValue(instance, val);
-                                else ((FieldInfo)member).SetValue(instance, val);
+                                    if (member is PropertyInfo prop) prop.SetValue(instance, val);
+                                    else ((FieldInfo)member).SetValue(instance, val);
+
+                                    rehydratedCount++;
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                // Isolated failure: if one property fails to deserialize due to version mismatch, skip it and continue
+                                _logger?.LogWarning(ex, "Failed to rehydrate property [{Property}] on component [{Component}]. Skipping property.",
+                                    member.Name, componentId);
                             }
                         }
 
-                        if (_options.EnableDiagnostics)
+                        if (_options.EnableDiagnostics && rehydratedCount > 0)
                         {
-                            _logger?.LogDebug("Rehydrated {Count} domain state variables into component [{Component}] from Redis.",
-                                stateDict.Count, componentId);
+                            _logger?.LogDebug("Rehydrated {Count} domain variables into component [{Component}] from Redis.",
+                                rehydratedCount, componentId);
                         }
                     }
                 }
@@ -96,7 +108,9 @@ public class ZeroTouchComponentActivator : IComponentActivator
         }
         catch (Exception ex)
         {
-            _logger?.LogError(ex, "Error during zero-touch state rehydration for component [{Component}].", componentType.FullName);
+            // Network resiliency: never throw an exception that would abort component creation or crash the UI page
+            _logger?.LogError(ex, "Error during zero-touch state rehydration for component [{Component}]. Proceeding with default state.",
+                componentType.FullName);
         }
 
         return instance;

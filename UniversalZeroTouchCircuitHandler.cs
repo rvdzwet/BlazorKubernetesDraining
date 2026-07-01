@@ -19,7 +19,11 @@ namespace BlazorKubernetesDraining;
 /// 
 /// Coverage:
 /// 1. Scoped Dependency Injected Services (registered via AddScopedState).
-/// 2. Active Razor Components (tracked via ScopedComponentStateRegistry).
+/// 2. Active Razor Components (tracked via ScopedComponentStateRegistry with WeakReferences).
+/// 
+/// Resiliency Features:
+/// - Uses StateSerializationConfig (circular reference handling, tolerant reading).
+/// - Isolated Try/Catch blocks per service and component to prevent cascading failures during checkpointing.
 /// </summary>
 public class UniversalZeroTouchCircuitHandler : CircuitHandler
 {
@@ -68,19 +72,27 @@ public class UniversalZeroTouchCircuitHandler : CircuitHandler
 
                 if (!string.IsNullOrEmpty(json))
                 {
-                    var stateDict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json);
+                    var stateDict = JsonSerializer.Deserialize<Dictionary<string, JsonElement>>(json, StateSerializationConfig.Options);
                     if (stateDict != null)
                     {
                         var members = ComponentStateClassifier.GetDomainStateMembers(reg.ServiceType);
                         foreach (var member in members)
                         {
-                            if (stateDict.TryGetValue(member.Name, out var element))
+                            try
                             {
-                                var targetType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
-                                var val = JsonSerializer.Deserialize(element, targetType);
+                                if (stateDict.TryGetValue(member.Name, out var element))
+                                {
+                                    var targetType = member is PropertyInfo p ? p.PropertyType : ((FieldInfo)member).FieldType;
+                                    var val = JsonSerializer.Deserialize(element, targetType, StateSerializationConfig.Options);
 
-                                if (member is PropertyInfo prop) prop.SetValue(reg.Instance, val);
-                                else ((FieldInfo)member).SetValue(reg.Instance, val);
+                                    if (member is PropertyInfo prop) prop.SetValue(reg.Instance, val);
+                                    else ((FieldInfo)member).SetValue(reg.Instance, val);
+                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                _logger?.LogWarning(ex, "Failed to rehydrate member [{Member}] on Scoped DI service [{Service}]. Skipping member.",
+                                    member.Name, reg.ServiceType.FullName);
                             }
                         }
 
@@ -125,11 +137,18 @@ public class UniversalZeroTouchCircuitHandler : CircuitHandler
                 var stateDict = new Dictionary<string, object?>();
                 foreach (var member in members)
                 {
-                    var val = member is PropertyInfo p ? p.GetValue(reg.Instance) : ((FieldInfo)member).GetValue(reg.Instance);
-                    stateDict[member.Name] = val;
+                    try
+                    {
+                        var val = member is PropertyInfo p ? p.GetValue(reg.Instance) : ((FieldInfo)member).GetValue(reg.Instance);
+                        stateDict[member.Name] = val;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug(ex, "Could not read member [{Member}] on DI service [{Service}] during checkpoint.", member.Name, reg.ServiceType.FullName);
+                    }
                 }
 
-                var json = JsonSerializer.Serialize(stateDict);
+                var json = JsonSerializer.Serialize(stateDict, StateSerializationConfig.Options);
                 await _cache.SetStringAsync($"{_options.RedisKeyPrefix}:{sessionId}:DI:{reg.ServiceType.FullName}", json, cacheOptions, cancellationToken);
             }
             catch (Exception ex)
@@ -138,7 +157,7 @@ public class UniversalZeroTouchCircuitHandler : CircuitHandler
             }
         }
 
-        // 2. Checkpoint Active Razor Components
+        // 2. Checkpoint Active Razor Components (WeakReferences are pruned automatically in GetTrackedComponents)
         foreach (var (componentId, instance, members) in _componentRegistry.GetTrackedComponents())
         {
             try
@@ -146,11 +165,18 @@ public class UniversalZeroTouchCircuitHandler : CircuitHandler
                 var stateDict = new Dictionary<string, object?>();
                 foreach (var member in members)
                 {
-                    var val = member is PropertyInfo p ? p.GetValue(instance) : ((FieldInfo)member).GetValue(instance);
-                    stateDict[member.Name] = val;
+                    try
+                    {
+                        var val = member is PropertyInfo p ? p.GetValue(instance) : ((FieldInfo)member).GetValue(instance);
+                        stateDict[member.Name] = val;
+                    }
+                    catch (Exception ex)
+                    {
+                        _logger?.LogDebug(ex, "Could not read member [{Member}] on component [{Component}] during checkpoint.", member.Name, componentId);
+                    }
                 }
 
-                var json = JsonSerializer.Serialize(stateDict);
+                var json = JsonSerializer.Serialize(stateDict, StateSerializationConfig.Options);
                 await _cache.SetStringAsync($"{_options.RedisKeyPrefix}:{sessionId}:Component:{componentId}", json, cacheOptions, cancellationToken);
             }
             catch (Exception ex)

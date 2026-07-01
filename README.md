@@ -58,6 +58,23 @@ We intercept the lowest layers of ASP.NET Core:
 
 ---
 
+## 🛡️ Rigorous Failure Mode Analysis & Enterprise Resiliency Design
+
+To guarantee long-term maintainability and prevent memory leaks or cascading failures in high-traffic Kubernetes environments, the state engine incorporates 5 critical defensive engineering protections:
+
+1. **Memory Leak Prevention via `WeakReference<object>` ([ScopedComponentStateRegistry.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedComponentStateRegistry.cs))**:
+   Tracking instantiated components in a long-lived Blazor circuit using strong references would prevent the Garbage Collector from freeing closed pages as users navigate. Our registry tracks components using weak references (`WeakReference<object>`) and prunes dead entries automatically. When a component is disposed, its memory is freed immediately.
+2. **Inheritance Hierarchy Climbing ([ComponentStateClassifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ComponentStateClassifier.cs))**:
+   Instead of using `BindingFlags.DeclaredOnly`, our classifier traverses the entire component inheritance hierarchy up to `ComponentBase`. Domain variables declared on intermediate abstract or base classes are captured and checkpointed reliably.
+3. **Non-Serializable Runtime Exclusion ([ComponentStateClassifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ComponentStateClassifier.cs))**:
+   The metadata classifier automatically detects and excludes non-serializable runtime primitives (`Stream`, `Task`, `Timer`, `CancellationTokenSource`, `IDisposable` sockets, and Reflection metadata) that would otherwise cause JSON serialization exceptions or hangs.
+4. **Resilient JSON Graph Serialization ([StateSerializationConfig.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/StateSerializationConfig.cs))**:
+   Configured with `ReferenceHandler.IgnoreCycles`, `PropertyNameCaseInsensitive = true`, and `MaxDepth = 64` to prevent stack overflows or serialization crashes when domain models contain circular references or navigation properties.
+5. **Isolated Property Try/Catch Boundaries**:
+   In both `ZeroTouchComponentActivator` and `UniversalZeroTouchCircuitHandler`, serialization and rehydration are wrapped in isolated per-property and per-service try/catch blocks. If a single property fails to deserialize due to a schema version mismatch during a deployment, it is logged and skipped without aborting the rest of the component or service rehydration.
+
+---
+
 ## 🛠️ How to Integrate into Your Blazor Application
 
 ### Step 1: Copy Library Files
@@ -159,3 +176,12 @@ public class ShoppingCartService
     }
 }
 ```
+
+---
+
+## 📄 License & Restrictions
+
+Licensed under the **MIT License (with Teun Kooijman Exclusion Clause)**. See the [LICENSE](file:///c:/Users/roman/source/repos/SocketConnectionTest/LICENSE) file for full details.
+
+> [!CAUTION]
+> **EXPLICIT EXCLUSION**: This permission and license is **EXPLICITLY NOT GRANTED to Teun Kooijman**. Teun Kooijman is strictly prohibited from using, copying, modifying, merging, publishing, distributing, sublicensing, or selling copies of this Software or any associated documentation files under any circumstances whatsoever.

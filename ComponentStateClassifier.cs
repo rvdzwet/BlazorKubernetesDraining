@@ -1,7 +1,10 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.IO;
 using System.Reflection;
+using System.Threading;
+using System.Threading.Tasks;
 using Microsoft.AspNetCore.Components;
 
 namespace BlazorKubernetesDraining;
@@ -10,18 +13,19 @@ namespace BlazorKubernetesDraining;
 /// High-performance automated metadata classifier that inspects any C# Type (Razor Component or Scoped DI Service)
 /// and discovers all instance domain variables without requiring attributes, interfaces, or manual annotations.
 /// 
-/// How it works:
-/// 1. Scans all private and public instance fields and properties declared on the type.
-/// 2. Filters out Blazor framework primitives (RenderHandle, EventCallback, ElementReference, RenderFragment).
-/// 3. Filters out Dependency Injection services marked with [Inject] or inheriting from IComponent.
-/// 4. Caches the resulting domain members per Type for zero-overhead runtime serialization and rehydration.
+/// Enterprise Resiliency & Failure Mode Protections:
+/// 1. Hierarchy Climbing: Scans across custom component base classes while cleanly stopping at ComponentBase.
+/// 2. Non-Serializable Exclusion: Automatically filters out runtime primitives (Streams, Tasks, Timers, CancellationTokens,
+///    Reflection metadata, and sockets) that would cause JSON serialization exceptions or hangs.
+/// 3. Injected Service Filtering: Ignores DI services marked with [Inject] or framework primitives (RenderHandle, EventCallback).
+/// 4. Zero-Overhead Caching: Results are cached per Type in a thread-safe ConcurrentDictionary.
 /// </summary>
 public static class ComponentStateClassifier
 {
     private static readonly ConcurrentDictionary<Type, MemberInfo[]> _stateMembersCache = new();
 
     /// <summary>
-    /// Gets all discoverable domain state members (fields and properties) for the given type.
+    /// Gets all discoverable domain state members (fields and properties) for the given type across its inheritance hierarchy.
     /// </summary>
     public static MemberInfo[] GetDomainStateMembers(Type targetType)
     {
@@ -30,28 +34,35 @@ public static class ComponentStateClassifier
             var members = new List<MemberInfo>();
             var flags = BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance | BindingFlags.DeclaredOnly;
 
-            // 1. Discover Properties
-            foreach (var prop in type.GetProperties(flags))
+            // Climb the inheritance hierarchy to capture domain variables declared on intermediate base classes
+            var currentType = type;
+            while (currentType != null && currentType != typeof(ComponentBase) && currentType != typeof(object))
             {
-                if (IsDomainState(prop.PropertyType, prop.GetCustomAttribute<InjectAttribute>() != null, prop.CanRead && prop.CanWrite))
+                // 1. Discover Properties
+                foreach (var prop in currentType.GetProperties(flags))
                 {
-                    members.Add(prop);
-                }
-            }
-
-            // 2. Discover Fields (including private backing fields for automatic properties if needed)
-            foreach (var field in type.GetFields(flags))
-            {
-                // Skip compiler-generated property backing fields if the property itself was already captured
-                if (field.Name.EndsWith("k__BackingField"))
-                {
-                    continue;
+                    if (IsDomainState(prop.PropertyType, prop.GetCustomAttribute<InjectAttribute>() != null, prop.CanRead && prop.CanWrite))
+                    {
+                        members.Add(prop);
+                    }
                 }
 
-                if (IsDomainState(field.FieldType, field.GetCustomAttribute<InjectAttribute>() != null, !field.IsInitOnly))
+                // 2. Discover Fields (including private backing fields for automatic properties if needed)
+                foreach (var field in currentType.GetFields(flags))
                 {
-                    members.Add(field);
+                    // Skip compiler-generated property backing fields if the property itself was already captured
+                    if (field.Name.EndsWith("k__BackingField"))
+                    {
+                        continue;
+                    }
+
+                    if (IsDomainState(field.FieldType, field.GetCustomAttribute<InjectAttribute>() != null, !field.IsInitOnly))
+                    {
+                        members.Add(field);
+                    }
                 }
+
+                currentType = currentType.BaseType;
             }
 
             return members.ToArray();
@@ -77,8 +88,20 @@ public static class ComponentStateClassifier
             return false;
         }
 
-        // Ignore standard System/Threading synchronization primitives or tasks
-        if (memberType.Namespace?.StartsWith("System.Threading") == true || memberType.Namespace?.StartsWith("System.Threading.Tasks") == true)
+        // Filter out non-serializable runtime primitives, threading primitives, streams, and IO/network sockets
+        if (typeof(Stream).IsAssignableFrom(memberType) ||
+            typeof(Task).IsAssignableFrom(memberType) ||
+            typeof(CancellationTokenSource).IsAssignableFrom(memberType) ||
+            typeof(CancellationToken).IsAssignableFrom(memberType) ||
+            typeof(Timer).IsAssignableFrom(memberType) ||
+            typeof(MemberInfo).IsAssignableFrom(memberType))
+        {
+            return false;
+        }
+
+        var ns = memberType.Namespace ?? string.Empty;
+        if (ns.StartsWith("System.Threading") || ns.StartsWith("System.IO") ||
+            ns.StartsWith("System.Net") || ns.StartsWith("System.Reflection"))
         {
             return false;
         }
