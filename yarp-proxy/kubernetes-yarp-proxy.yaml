@@ -1,0 +1,66 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: blazor-yarp-proxy
+  labels:
+    app: blazor-yarp-proxy
+spec:
+  type: ClusterIP
+  ports:
+    - port: 80
+      targetPort: 8080
+      name: http
+  selector:
+    app: blazor-yarp-proxy
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: blazor-yarp-proxy
+  labels:
+    app: blazor-yarp-proxy
+spec:
+  replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: blazor-yarp-proxy
+  template:
+    metadata:
+      labels:
+        app: blazor-yarp-proxy
+    spec:
+      containers:
+        - name: yarp-proxy
+          image: my-registry/blazor-yarp-proxy:latest
+          ports:
+            - containerPort: 8080
+              name: http
+          env:
+            - name: ASPNETCORE_ENVIRONMENT
+              value: "Production"
+            - name: ASPNETCORE_URLS
+              value: "http://+:8080"
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 10
+            periodSeconds: 10
+          resources:
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+            requests:
+              memory: "128Mi"
+              cpu: "100m"

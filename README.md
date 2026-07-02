@@ -191,6 +191,14 @@ To safely re-render UI banners or menus during pod draining without losing local
 }
 ```
 
+### Why Do We Need a Reverse Proxy (YARP)?
+Blazor Server applications rely on persistent, long-lived **SignalR WebSocket connections** and in-memory circuit state. Standard Kubernetes `Service` load balancers (Layer 4 IPVS/iptables) route connections randomly at the IP level and do not understand HTTP cookies, WebSockets, or Blazor circuits.
+
+To prevent connection drops during Kubernetes rolling updates, we provide an open-source self-hosted **YARP (Yet Another Reverse Proxy)** deployment:
+1. **Sticky Sessions (Cookie Affinity)**: Assigns a `.Blazor.Affinity` cookie so every SignalR request from a client reliably routes to the exact same pod.
+2. **Active Readiness Probing**: When a pod intercepts `SIGTERM` and sets `IsShuttingDown = true`, its Readiness endpoint (`/health/ready`) returns **503 Service Unavailable**. YARP actively probes `/health/ready` every 5 seconds. The moment it detects a 503, YARP immediately removes the draining pod from routing for new traffic, while keeping existing open WebSocket circuits alive until they naturally complete!
+3. **Failover Redistribution**: When a draining pod finishes and closes its circuits, YARP redistributes the client to a healthy pod where `[PersistState]` rehydrates their exact UI from Redis.
+
 ---
 
 ## 📂 File Manifest
@@ -214,6 +222,9 @@ To safely re-render UI banners or menus during pod draining without losing local
 | [ScopedComponentStateRegistry.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedComponentStateRegistry.cs) | WeakReference-based component tracking per circuit |
 | [ICircuitDrainingNotifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ICircuitDrainingNotifier.cs) | Scoped culture-aware event dispatcher for Blazor components |
 | [kubernetes-deployment.yaml](file:///c:/Users/roman/source/repos/SocketConnectionTest/kubernetes-deployment.yaml) | Clean K8s manifest with native Kerberos sidecar |
+| [yarp-proxy/Program.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/yarp-proxy/Program.cs) | YARP proxy pipeline with Forwarded Headers & failover logging |
+| [yarp-proxy/appsettings.json](file:///c:/Users/roman/source/repos/SocketConnectionTest/yarp-proxy/appsettings.json) | YARP cluster config with Cookie affinity & 503 active probing |
+| [yarp-proxy/kubernetes-yarp-proxy.yaml](file:///c:/Users/roman/source/repos/SocketConnectionTest/yarp-proxy/kubernetes-yarp-proxy.yaml) | K8s manifest for deploying YARP reverse proxy |
 
 ---
 
