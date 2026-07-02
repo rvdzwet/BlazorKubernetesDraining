@@ -156,6 +156,41 @@ public class ShoppingCartService
 }
 ```
 
+### Culture-Aware UI Notifications (SIGTERM Handling)
+When SIGTERM arrives, background events run on thread pool threads with the system default culture (`InvariantCulture`), which causes standard `IStringLocalizer` lookups to fail and revert translated strings to technical keys. 
+
+To safely re-render UI banners or menus during pod draining without losing localized strings, inject the scoped `ICircuitDrainingNotifier`:
+
+```razor
+@inject ICircuitDrainingNotifier DrainingNotifier
+@implements IDisposable
+
+@if (DrainingNotifier.IsShuttingDown)
+{
+    <div class="alert alert-warning">
+        @Localizer["MAINTENANCE_BANNER_TEXT"]
+    </div>
+}
+
+@code {
+    protected override void OnInitialized()
+    {
+        DrainingNotifier.OnDrainingStarted += OnDrainStarted;
+    }
+
+    private void OnDrainStarted()
+    {
+        // ExecutionContext automatically flows the circuit's localized culture into StateHasChanged!
+        InvokeAsync(StateHasChanged);
+    }
+
+    public void Dispose()
+    {
+        DrainingNotifier.OnDrainingStarted -= OnDrainStarted;
+    }
+}
+```
+
 ---
 
 ## 📂 File Manifest
@@ -177,6 +212,7 @@ public class ShoppingCartService
 | [DrainingOptions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/DrainingOptions.cs) | Draining configuration |
 | [ServiceCollectionExtensions.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ServiceCollectionExtensions.cs) | `AddBlazorKubernetesDraining()` + `AddPersistStatePreservation()` |
 | [ScopedComponentStateRegistry.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ScopedComponentStateRegistry.cs) | WeakReference-based component tracking per circuit |
+| [ICircuitDrainingNotifier.cs](file:///c:/Users/roman/source/repos/SocketConnectionTest/ICircuitDrainingNotifier.cs) | Scoped culture-aware event dispatcher for Blazor components |
 | [kubernetes-deployment.yaml](file:///c:/Users/roman/source/repos/SocketConnectionTest/kubernetes-deployment.yaml) | Clean K8s manifest with native Kerberos sidecar |
 
 ---

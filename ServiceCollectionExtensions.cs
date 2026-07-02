@@ -45,6 +45,7 @@ public static class ServiceCollectionExtensions
         services.AddSingleton<CircuitDrainingState>();
         services.AddSingleton<ActiveCircuitTracker>();
         services.AddScoped<CircuitHandler>(sp => sp.GetRequiredService<ActiveCircuitTracker>());
+        services.AddScoped<ICircuitDrainingNotifier, CircuitDrainingNotifier>();
         services.AddSingleton<IHostLifetime, DrainingHostLifetime>();
 
         services.AddHealthChecks()

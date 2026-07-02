@@ -64,9 +64,25 @@ public class CircuitDrainingState
 {
     private volatile bool _isShuttingDown;
 
+    /// <summary>
+    /// Event raised when IsShuttingDown transitions to true (e.g., upon OS SIGTERM interception).
+    /// </summary>
+    public event Action? OnShutdownInitiated;
+
     public bool IsShuttingDown
     {
         get => _isShuttingDown;
-        set => _isShuttingDown = value;
+        set
+        {
+            if (!_isShuttingDown && value)
+            {
+                _isShuttingDown = true;
+                OnShutdownInitiated?.Invoke();
+            }
+            else
+            {
+                _isShuttingDown = value;
+            }
+        }
     }
 }
